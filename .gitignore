@@ -1,0 +1,23 @@
+# Test artifacts
+*.test
+*.out
+coverage.*
+
+# PocketBase data (local-only state)
+/pb_data/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Claude local settings
+.claude/settings.local.json

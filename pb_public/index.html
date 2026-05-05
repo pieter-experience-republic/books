@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>ebooks</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>ebooks</h1>
+    <div id="status-pill" class="pill pill-off">irc: offline</div>
+    <div id="user-bar" hidden>
+      <span id="user-email"></span>
+      <button id="logout">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="auth" hidden>
+      <h2>Sign in</h2>
+      <form id="auth-form">
+        <input id="auth-email" type="email" placeholder="email" autocomplete="username" required />
+        <input id="auth-password" type="password" placeholder="password" autocomplete="current-password" required />
+        <button type="submit">Sign in</button>
+        <button type="button" id="auth-register">Create account</button>
+        <p id="auth-error" class="error"></p>
+      </form>
+    </section>
+
+    <section id="app" hidden>
+      <form id="search-form">
+        <input id="query" type="text" placeholder="title or author" autofocus required maxlength="200" />
+        <button type="submit" id="search-btn">Search</button>
+        <span id="cooldown"></span>
+      </form>
+
+      <h3>Searches</h3>
+      <table id="searches-table">
+        <thead><tr><th>Query</th><th>Status</th><th>Results</th><th>When</th></tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <h3 id="results-heading" hidden>Results <span class="dim">(epub only)</span></h3>
+      <table id="results-table" hidden>
+        <thead><tr><th>Server</th><th>Author</th><th>Title</th><th>Size</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <h3>Downloads</h3>
+      <table id="downloads-table">
+        <thead><tr><th>File</th><th>Status</th><th>Size</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/pocketbase@0.26.8/dist/pocketbase.umd.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
