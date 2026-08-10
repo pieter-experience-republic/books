@@ -13,13 +13,19 @@ const downloadsBody = $('#downloads-table tbody');
 const resultsBody = $('#results-table tbody');
 const resultsTable = $('#results-table');
 const resultsHeading = $('#results-heading');
+const resultsStatus = $('#results-status');
+const toastContainer = $('#toast-container');
 
 const RESULTS_PREVIEW = 10;
 
 let activeSearchId = null;
+let activeSearchMeta = null; // {id, query, status, error} for the active search
 let cooldownTimer = null;
 let activeResults = [];   // all rows for the active search
 let resultsExpanded = false;
+const downloadOutcomesSeen = new Set(); // download ids already toasted with a terminal outcome
+const downloadStartedSeen = new Set(); // download ids already toasted once transfer began
+const resultDownloadButtons = new Map(); // download id -> the result row's button, so it can track status past "Queued…"
 
 // ---- auth ----
 
@@ -86,6 +92,7 @@ $('#logout').addEventListener('click', () => {
 // ---- main app ----
 
 async function bootstrapData() {
+  renderActiveStatus();
   await loadSearches();
   await loadDownloads();
   subscribe();
@@ -96,8 +103,10 @@ async function bootstrapData() {
 async function pollStatus() {
   try {
     const s = await pb.send('/api/ebooks/status', {});
-    statusPill.textContent = s.connected ? `irc: ${s.nick}` : 'irc: offline';
-    statusPill.className = 'pill ' + (s.connected ? 'pill-on' : 'pill-off');
+    const label = s.connected ? 'Connected' : s.connecting ? 'Connecting…' : 'Offline';
+    const cls = s.connected ? 'pill-on' : s.connecting ? 'pill-warn' : 'pill-off';
+    statusPill.innerHTML = `<span class="status-dot" aria-hidden="true"></span>${label}`;
+    statusPill.className = 'pill ' + cls;
 
     const next = new Date(s.next_search_at);
     const wait = next.getTime() - Date.now();
@@ -132,14 +141,21 @@ $('#search-form').addEventListener('submit', async (e) => {
       method: 'POST',
       body: { query },
     });
-    activeSearchId = res.id;
-    showResultsFor(activeSearchId);
+    activateSearch({ id: res.id, query, status: res.status, error: '' });
   } catch (err) {
     alert(err?.message || 'search failed');
   } finally {
     pollStatus();
   }
 });
+
+// Make a search (new or from history) the one shown in the results panel.
+function activateSearch(rec) {
+  activeSearchId = rec.id;
+  activeSearchMeta = { id: rec.id, query: rec.query, status: rec.status, error: rec.error };
+  renderActiveStatus();
+  showResultsFor(rec.id);
+}
 
 async function loadSearches() {
   const list = await pb.collection('searches').getList(1, 30, { sort: '-created' });
@@ -156,15 +172,143 @@ async function loadDownloads() {
 function subscribe() {
   pb.collection('searches').subscribe('*', (e) => {
     addOrUpdateSearchRow(e.record);
+    if (e.record.id === activeSearchId) {
+      activeSearchMeta = {
+        id: e.record.id, query: e.record.query,
+        status: e.record.status, error: e.record.error,
+      };
+      renderActiveStatus();
+    }
   });
   pb.collection('search_results').subscribe('*', (e) => {
     if (e.record.search !== activeSearchId) return;
     activeResults.push(e.record);
+    activeResults.sort(compareResults);
     renderResults();
   });
   pb.collection('downloads').subscribe('*', (e) => {
     addOrUpdateDownloadRow(e.record);
+    handleDownloadStarted(e.record);
+    handleDownloadOutcome(e.record);
+    updateResultButton(e.record);
   });
+}
+
+// Fires once, right as a download actually starts moving bytes — the
+// only signal, short of opening Download history, that a queued
+// request wasn't silently dropped (it can otherwise sit quiet for up
+// to the 5-minute timeout before you'd hear anything either way).
+function handleDownloadStarted(rec) {
+  if (rec.status !== 'downloading' || downloadStartedSeen.has(rec.id)) return;
+  downloadStartedSeen.add(rec.id);
+  const label = rec.filename || filenameHint(rec.command);
+  showToast(`Started downloading “${label}”`, { duration: 4000 });
+}
+
+// Keeps a search result's own Download button in sync with the download
+// it kicked off, past the initial "Queued…" — otherwise it just sits
+// there forever regardless of what actually happens to the download.
+function updateResultButton(rec) {
+  const btn = resultDownloadButtons.get(rec.id);
+  if (!btn) return;
+  if (rec.status === 'downloading') {
+    setResultButtonActive(btn, rec.id, 'Downloading…');
+  } else if (rec.status === 'complete') {
+    btn.disabled = true;
+    btn.classList.remove('btn-active-download');
+    delete btn.dataset.downloadId;
+    btn.removeAttribute('title');
+    btn.textContent = 'Downloaded';
+    resultDownloadButtons.delete(rec.id);
+  } else if (rec.status === 'failed' || rec.status === 'cancelled') {
+    btn.disabled = false;
+    btn.classList.remove('btn-active-download');
+    delete btn.dataset.downloadId;
+    btn.removeAttribute('title');
+    btn.textContent = 'Retry';
+    resultDownloadButtons.delete(rec.id);
+  }
+}
+
+// Renders the queued/downloading state: a spinner, the status label, and
+// a small "×" that — since the whole button stays clickable — cancels
+// the download right where the user is watching it.
+function setResultButtonActive(btn, downloadId, label) {
+  btn.disabled = false;
+  btn.dataset.downloadId = downloadId;
+  btn.title = 'Click to cancel';
+  btn.classList.add('btn-active-download');
+  btn.innerHTML = `<span class="spinner" aria-hidden="true"></span>` +
+    `<span>${label}</span><span class="cancel-x" aria-hidden="true">×</span>`;
+}
+
+// Fires once per download, the moment it actually finishes (live only —
+// never for the pre-existing rows loadDownloads() populates on startup).
+// Saves the file straight to the device and confirms with a toast, so
+// there's no need to go find the downloads table to grab it.
+function handleDownloadOutcome(rec) {
+  if (downloadOutcomesSeen.has(rec.id)) return;
+  const label = rec.filename || filenameHint(rec.command);
+  if (rec.status === 'complete' && rec.file) {
+    downloadOutcomesSeen.add(rec.id);
+    saveDownloadToDevice(rec);
+    showToast(`Downloaded “${label}”`, {
+      actionLabel: 'Save again',
+      onAction: () => saveDownloadToDevice(rec),
+    });
+  } else if (rec.status === 'failed') {
+    downloadOutcomesSeen.add(rec.id);
+    showToast(`Download failed: ${label}${rec.error ? ' — ' + rec.error : ''}`, {
+      variant: 'err', duration: 8000,
+    });
+  } else if (rec.status === 'cancelled') {
+    downloadOutcomesSeen.add(rec.id);
+    showToast(`Cancelled “${label}”`, { duration: 4000 });
+  }
+}
+
+function saveDownloadToDevice(rec) {
+  const url = pb.files.getURL(rec, rec.file, fileToken ? { token: fileToken } : {});
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = rec.filename || '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  return url;
+}
+
+// Lightweight toast: message + optional action button, auto-dismissing.
+// Browsers can silently block auto-triggered downloads that don't come
+// from a direct click (e.g. Chrome's "multiple automatic downloads"
+// guard), so every toast carries a manual fallback action.
+function showToast(message, { actionLabel, onAction, variant, duration = 6000 } = {}) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (variant === 'err' ? ' toast-err' : '');
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+  let timer = null;
+  const dismiss = () => {
+    clearTimeout(timer);
+    el.classList.add('leaving');
+    el.addEventListener('animationend', () => el.remove(), { once: true });
+  };
+  if (actionLabel) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = actionLabel;
+    btn.addEventListener('click', () => { onAction?.(); dismiss(); });
+    el.appendChild(btn);
+  }
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.textContent = '✕';
+  closeBtn.setAttribute('aria-label', 'Dismiss');
+  closeBtn.addEventListener('click', dismiss);
+  el.appendChild(closeBtn);
+  toastContainer.appendChild(el);
+  timer = setTimeout(dismiss, duration);
 }
 
 function addOrUpdateSearchRow(rec) {
@@ -174,12 +318,10 @@ function addOrUpdateSearchRow(rec) {
     tr.dataset.id = rec.id;
     tr.innerHTML = '<td></td><td></td><td></td><td></td>';
     tr.style.cursor = 'pointer';
-    tr.addEventListener('click', () => {
-      activeSearchId = rec.id;
-      showResultsFor(rec.id);
-    });
+    tr.addEventListener('click', () => activateSearch(tr._record));
     searchesBody.prepend(tr);
   }
+  tr._record = rec;
   const cells = tr.children;
   cells[0].textContent = rec.query;
   cells[1].innerHTML = `<span class="status-${rec.status}">${rec.status}</span>` +
@@ -189,63 +331,148 @@ function addOrUpdateSearchRow(rec) {
 }
 
 async function showResultsFor(searchId) {
-  resultsHeading.hidden = false;
-  resultsTable.hidden = false;
-  resultsBody.innerHTML = '';
   activeResults = [];
   resultsExpanded = false;
+  renderResults();
   const list = await pb.collection('search_results').getList(1, 200, {
     filter: `search="${searchId}"`,
-    sort: 'server,author,title',
+    sort: 'is_duplicate,-relevance,author,title',
   });
-  activeResults = list.items;
+  if (searchId !== activeSearchId) return; // user moved on to a different search
+  activeResults = list.items.sort(compareResults);
   renderResults();
+}
+
+// Non-duplicates first, best query match first, alphabetical tiebreak.
+// Mirrors the server-side `sort` param above so live-streamed rows (which
+// bypass that sort) end up in the same order as a fresh page load.
+function compareResults(a, b) {
+  if (a.is_duplicate !== b.is_duplicate) return a.is_duplicate ? 1 : -1;
+  if (a.relevance !== b.relevance) return b.relevance - a.relevance;
+  if (a.author !== b.author) return a.author < b.author ? -1 : 1;
+  return a.title < b.title ? -1 : a.title > b.title ? 1 : 0;
 }
 
 function renderResults() {
   resultsBody.innerHTML = '';
   const total = activeResults.length;
+  resultsHeading.hidden = total === 0;
+  resultsTable.hidden = total === 0;
+  if (total > 0) {
+    resultsHeading.innerHTML = `Results (${total}) <span class="dim">— epub only</span>`;
+  }
   const limit = resultsExpanded ? total : Math.min(RESULTS_PREVIEW, total);
   for (let i = 0; i < limit; i++) {
     resultsBody.appendChild(buildResultRow(activeResults[i]));
   }
-  if (!resultsExpanded && total > RESULTS_PREVIEW) {
+  if (total > RESULTS_PREVIEW) {
     const tr = document.createElement('tr');
     tr.className = 'show-more';
-    tr.innerHTML = `<td colspan="5">Show all ${total} results</td>`;
+    tr.innerHTML = `<td colspan="5">${resultsExpanded ? 'Show fewer' : `Show all ${total} results`}</td>`;
     tr.addEventListener('click', () => {
-      resultsExpanded = true;
+      resultsExpanded = !resultsExpanded;
       renderResults();
     });
     resultsBody.appendChild(tr);
+  }
+  renderActiveStatus();
+}
+
+// Status line shown above the results table: idle / queued / searching /
+// failed / no-results. Hidden once a non-empty results table is showing.
+function renderActiveStatus() {
+  if (!activeSearchMeta) {
+    resultsStatus.hidden = false;
+    resultsStatus.textContent = 'Run a search above to see results here.';
+    return;
+  }
+  const { id, query, status, error } = activeSearchMeta;
+  if (status === 'queued' || status === 'searching') {
+    resultsStatus.hidden = false;
+    resultsStatus.innerHTML =
+      `<span class="spinner" aria-hidden="true"></span>` +
+      `<span>${status === 'queued' ? 'Queued' : 'Searching for'} “${escape(query)}”… ` +
+      `<span class="dim">can take up to a minute</span></span>` +
+      `<button type="button" class="cancel-search-btn">Cancel</button>`;
+    resultsStatus.querySelector('.cancel-search-btn').addEventListener('click', (e) => {
+      e.target.disabled = true;
+      e.target.textContent = 'Cancelling…';
+      cancelActiveSearch(id);
+    });
+  } else if (status === 'cancelled') {
+    resultsStatus.hidden = false;
+    resultsStatus.innerHTML = `<span class="dim">Search “${escape(query)}” cancelled.</span>`;
+  } else if (status === 'failed') {
+    resultsStatus.hidden = false;
+    resultsStatus.innerHTML = `<span class="status-failed">Search failed${error ? ': ' + escape(error) : ''}</span>`;
+  } else {
+    resultsStatus.hidden = activeResults.length !== 0;
+    if (!resultsStatus.hidden) {
+      resultsStatus.textContent = `No epub results for “${query}”.`;
+    }
+  }
+}
+
+async function cancelActiveSearch(id) {
+  try {
+    await pb.send('/api/ebooks/search/cancel', { method: 'POST', body: { id } });
+  } catch (err) {
+    alert(err?.message || 'cancel failed');
+    return;
+  }
+  // Optimistic — the realtime "searches" update will confirm this shortly.
+  if (activeSearchId === id && activeSearchMeta) {
+    activeSearchMeta = { ...activeSearchMeta, status: 'cancelled' };
+    renderActiveStatus();
+  }
+}
+
+async function cancelDownload(id) {
+  try {
+    await pb.send('/api/ebooks/download/cancel', { method: 'POST', body: { id } });
+    // The realtime "downloads" update will repaint the row as cancelled.
+  } catch (err) {
+    alert(err?.message || 'cancel failed');
   }
 }
 
 function buildResultRow(rec) {
   const tr = document.createElement('tr');
+  tr.classList.toggle('result-duplicate', !!rec.is_duplicate);
   tr.innerHTML = `
     <td>${escape(rec.server)}</td>
     <td>${escape(rec.author)}</td>
     <td>${escape(rec.title)}</td>
     <td>${escape(rec.size)}</td>
-    <td><button>Download</button></td>
+    <td><button type="button">Download</button></td>
   `;
-  tr.querySelector('button').addEventListener('click', async (e) => {
-    e.target.disabled = true;
-    e.target.textContent = 'Queued…';
+  const btn = tr.querySelector('button');
+  // While a download is in flight the button itself doubles as the
+  // cancel action (via btn.dataset.downloadId) — this is where the user
+  // is actually looking mid-download, not the collapsed history panel.
+  btn.addEventListener('click', async () => {
+    if (btn.dataset.downloadId) {
+      btn.disabled = true;
+      cancelDownload(btn.dataset.downloadId);
+      return;
+    }
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Queued…';
     try {
-      await pb.send('/api/ebooks/download', {
+      const res = await pb.send('/api/ebooks/download', {
         method: 'POST',
         body: { command: rec.full, result_id: rec.id },
       });
-      // Bring the downloads table into view so the new row is obvious.
-      document.querySelector('#downloads-table').scrollIntoView({
-        behavior: 'smooth', block: 'center',
-      });
+      // Track this button against the download so it can follow its
+      // status (downloading/complete/failed) instead of being stuck
+      // reading "Queued…" forever. No need to jump to the downloads
+      // section either — a toast will confirm completion.
+      resultDownloadButtons.set(res.id, btn);
+      setResultButtonActive(btn, res.id, 'Queued…');
     } catch (err) {
       alert(err?.message || 'download failed');
-      e.target.disabled = false;
-      e.target.textContent = 'Download';
+      btn.disabled = false;
+      btn.textContent = 'Download';
     }
   });
   return tr;
@@ -259,9 +486,9 @@ function addOrUpdateDownloadRow(rec) {
     tr.dataset.id = rec.id;
     tr.innerHTML = '<td></td><td></td><td></td><td></td>';
     // Tap anywhere on the row toggles full filename, except on the
-    // save-link itself (we don't want to swallow the download click).
+    // save-link or cancel button (we don't want to swallow those clicks).
     tr.addEventListener('click', (e) => {
-      if (e.target.closest('a')) return;
+      if (e.target.closest('a, button')) return;
       tr.classList.toggle('expanded');
     });
     downloadsBody.prepend(tr);
@@ -276,6 +503,13 @@ function addOrUpdateDownloadRow(rec) {
   if (rec.status === 'complete' && rec.file) {
     const url = pb.files.getURL(rec, rec.file, fileToken ? { token: fileToken } : {});
     cells[3].innerHTML = `<a href="${escape(url)}" download>save</a>`;
+  } else if (rec.status === 'queued' || rec.status === 'downloading') {
+    cells[3].innerHTML = `<button type="button" class="cancel-download-btn">Cancel</button>`;
+    cells[3].querySelector('button').addEventListener('click', (e) => {
+      e.target.disabled = true;
+      e.target.textContent = '…';
+      cancelDownload(rec.id);
+    });
   } else {
     cells[3].innerHTML = '';
   }

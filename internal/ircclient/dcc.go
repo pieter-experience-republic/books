@@ -5,6 +5,7 @@
 package ircclient
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -64,13 +65,25 @@ func ParseDCCSend(text string) (*DCCSend, error) {
 //
 // io.Copy is avoided because the DCC server doesn't reliably half-close
 // the socket; reading until we hit Size is the only deterministic signal.
-// A per-read deadline guards against bots that connect then stall.
-func (d DCCSend) Download(w io.Writer) error {
+// A per-read deadline guards against bots that connect then stall, and
+// cancelling ctx aborts an in-flight transfer by force-closing the
+// socket (there's no other way to interrupt a blocked conn.Read).
+func (d DCCSend) Download(ctx context.Context, w io.Writer) error {
 	conn, err := net.DialTimeout("tcp", d.IP+":"+d.Port, 30*time.Second)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
+		}
+	}()
 
 	var received int64
 	buf := make([]byte, 4096)
@@ -88,6 +101,9 @@ func (d DCCSend) Download(w io.Writer) error {
 		if err != nil {
 			if err == io.EOF {
 				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 			return err
 		}

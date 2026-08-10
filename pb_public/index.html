@@ -1,61 +1,124 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>ebooks</title>
-  <link rel="stylesheet" href="/styles.css" />
-</head>
-<body>
-  <header>
-    <h1>ebooks</h1>
-    <div id="status-pill" class="pill pill-off">irc: offline</div>
-    <div id="user-bar" hidden>
-      <span id="user-email"></span>
-      <button id="logout">Sign out</button>
-    </div>
-  </header>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>ebooks</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>ebooks</h1>
+      <div id="status-pill" class="pill pill-warn">
+        <span class="status-dot" aria-hidden="true"></span>Connecting…
+      </div>
+      <div id="user-bar" hidden>
+        <span id="user-email"></span>
+        <button id="logout">Sign out</button>
+      </div>
+    </header>
 
-  <main>
-    <section id="auth" hidden>
-      <h2>Sign in</h2>
-      <form id="auth-form">
-        <input id="auth-email" type="email" placeholder="email" autocomplete="username" required />
-        <input id="auth-password" type="password" placeholder="password" autocomplete="current-password" required />
-        <button type="submit">Sign in</button>
-        <button type="button" id="auth-register">Create account</button>
-        <p id="auth-error" class="error"></p>
-      </form>
-    </section>
+    <main>
+      <section id="auth" hidden>
+        <h2>Sign in</h2>
+        <form id="auth-form">
+          <input
+            id="auth-email"
+            type="email"
+            placeholder="email"
+            autocomplete="username"
+            required
+          />
+          <input
+            id="auth-password"
+            type="password"
+            placeholder="password"
+            autocomplete="current-password"
+            required
+          />
+          <button type="submit">Sign in</button>
+          <button type="button" id="auth-register">Create account</button>
+          <p id="auth-error" class="error"></p>
+        </form>
+      </section>
 
-    <section id="app" hidden>
-      <form id="search-form">
-        <input id="query" type="text" placeholder="title or author" autofocus required maxlength="200" />
-        <button type="submit" id="search-btn">Search</button>
-        <span id="cooldown"></span>
-      </form>
+      <section id="app" hidden>
+        <form id="search-form">
+          <input
+            id="query"
+            type="text"
+            placeholder="Title and/or author"
+            autofocus
+            required
+            maxlength="200"
+          />
+          <button type="submit" id="search-btn">Search</button>
+          <span id="cooldown"></span>
+        </form>
+        <p class="dim search-tip">
+          Tip: include the author's name (e.g. “Sun Tzu Art of War”) for
+          better-ranked results.
+        </p>
 
-      <h3>Searches</h3>
-      <table id="searches-table">
-        <thead><tr><th>Query</th><th>Status</th><th>Results</th><th>When</th></tr></thead>
-        <tbody></tbody>
-      </table>
+        <div id="results-panel">
+          <h3 id="results-heading" hidden>Results</h3>
+          <p id="results-status" class="dim" hidden></p>
+          <table id="results-table" hidden>
+            <thead>
+              <tr>
+                <th>Server</th>
+                <th>Author</th>
+                <th>Title</th>
+                <th>Size</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
 
-      <h3 id="results-heading" hidden>Results <span class="dim">(epub only)</span></h3>
-      <table id="results-table" hidden>
-        <thead><tr><th>Server</th><th>Author</th><th>Title</th><th>Size</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table>
+        <details id="downloads-details">
+          <summary>Download history</summary>
+          <p class="dim helper-line">
+            A download that doesn't start within 5 minutes is cancelled
+            automatically — or cancel one yourself any time.
+          </p>
+          <table id="downloads-table">
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Status</th>
+                <th>Size</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </details>
 
-      <h3>Downloads</h3>
-      <table id="downloads-table">
-        <thead><tr><th>File</th><th>Status</th><th>Size</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </section>
-  </main>
+        <details id="history-details">
+          <summary>Search history</summary>
+          <table id="searches-table">
+            <thead>
+              <tr>
+                <th>Query</th>
+                <th>Status</th>
+                <th>Results</th>
+                <th>When</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </details>
+      </section>
+    </main>
 
-  <script src="https://cdn.jsdelivr.net/npm/pocketbase@0.26.8/dist/pocketbase.umd.js"></script>
-  <script src="/app.js"></script>
-</body>
+    <div id="toast-container" aria-live="polite"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/pocketbase@0.26.8/dist/pocketbase.umd.js"></script>
+    <script src="/app.js"></script>
+  </body>
 </html>

@@ -31,6 +31,14 @@ const (
 	DefaultUserAgent  = "OpenBooks 4.3.0" // irchighway-allowlisted; bump when upstream openbooks does
 	DefaultSearchGap  = 10 * time.Second
 	connectAfterDelay = 2 * time.Second
+
+	// dccWaitTimeout bounds how long we'll wait for a bot to even start
+	// sending a requested book (i.e. no DCC SEND at all). Kept generous
+	// since busy bots legitimately queue requests for several minutes;
+	// this is a backstop against a silently dropped/ignored request, not
+	// a tight SLA. Once a transfer is actually underway, dccReadTimeout
+	// (in dcc.go) governs stalls instead.
+	dccWaitTimeout = 5 * time.Minute
 )
 
 // Callbacks are invoked from the IRC reader goroutine. Implementations
@@ -49,16 +57,16 @@ type Callbacks struct {
 }
 
 type Config struct {
-	Server     string
-	Port       int
-	Channel    string
-	SearchBot  string
-	UserAgent  string
-	Nick       string
-	SearchGap  time.Duration
-	WorkDir    string // where DCC files are written
-	Logger     *log.Logger
-	Callbacks  Callbacks
+	Server    string
+	Port      int
+	Channel   string
+	SearchBot string
+	UserAgent string
+	Nick      string
+	SearchGap time.Duration
+	WorkDir   string // where DCC files are written
+	Logger    *log.Logger
+	Callbacks Callbacks
 }
 
 func (c *Config) applyDefaults() {
@@ -102,22 +110,25 @@ type pendingSearch struct {
 }
 
 type pendingDownload struct {
-	id          string
-	command     string
+	id           string
+	command      string
 	filenameHint string // best-effort filename inside the command
 }
 
 type Manager struct {
-	cfg       Config
-	client    *girc.Client
-	searchCh  chan pendingSearch
+	cfg      Config
+	client   *girc.Client
+	searchCh chan pendingSearch
 
-	mu            sync.Mutex
-	connected     bool
-	nick          string
-	lastSearchAt  time.Time
-	pendingSearch []pendingSearch    // FIFO of accepted searches waiting on results
-	pendingDLs    []pendingDownload  // FIFO of accepted downloads waiting on DCC SEND
+	mu              sync.Mutex
+	connected       bool
+	connecting      bool // dialing/registering, or waiting to retry after a drop
+	nick            string
+	lastSearchAt    time.Time
+	pendingSearch   []pendingSearch               // FIFO of accepted searches waiting on results
+	pendingDLs      []pendingDownload             // FIFO of accepted downloads waiting on DCC SEND
+	cancelled       map[string]bool               // search IDs cancelled before searchSender got to send them
+	activeDownloads map[string]context.CancelFunc // download IDs currently mid-transfer
 }
 
 func New(cfg Config) *Manager {
@@ -128,8 +139,10 @@ func New(cfg Config) *Manager {
 	_ = os.MkdirAll(cfg.WorkDir, 0o755)
 
 	m := &Manager{
-		cfg:      cfg,
-		searchCh: make(chan pendingSearch, 256),
+		cfg:             cfg,
+		searchCh:        make(chan pendingSearch, 256),
+		cancelled:       make(map[string]bool),
+		activeDownloads: make(map[string]context.CancelFunc),
 	}
 	m.client = girc.New(girc.Config{
 		Server: cfg.Server,
@@ -157,12 +170,13 @@ func (m *Manager) Nick() string {
 }
 
 type Status struct {
-	Connected      bool      `json:"connected"`
-	Nick           string    `json:"nick"`
-	LastSearchAt   time.Time `json:"last_search_at"`
-	NextSearchAt   time.Time `json:"next_search_at"`
-	PendingSearch  int       `json:"pending_searches"`
-	PendingDownload int      `json:"pending_downloads"`
+	Connected       bool      `json:"connected"`
+	Connecting      bool      `json:"connecting"`
+	Nick            string    `json:"nick"`
+	LastSearchAt    time.Time `json:"last_search_at"`
+	NextSearchAt    time.Time `json:"next_search_at"`
+	PendingSearch   int       `json:"pending_searches"`
+	PendingDownload int       `json:"pending_downloads"`
 }
 
 func (m *Manager) Status() Status {
@@ -170,6 +184,7 @@ func (m *Manager) Status() Status {
 	defer m.mu.Unlock()
 	return Status{
 		Connected:       m.connected,
+		Connecting:      m.connecting,
 		Nick:            m.nick,
 		LastSearchAt:    m.lastSearchAt,
 		NextSearchAt:    m.lastSearchAt.Add(m.cfg.SearchGap),
@@ -184,9 +199,28 @@ func (m *Manager) QueueSearch(searchID, query string) {
 	m.searchCh <- pendingSearch{id: searchID, query: query}
 }
 
+// CancelSearch gives up on a search the caller no longer wants a reply
+// for. If it hasn't been sent to the bot yet, searchSender will skip it
+// (and won't burn the 10s rate-limit slot on it). If it's already
+// in-flight, dropping it from pendingSearch stops it from soaking up
+// the correlation for a NOTICE that's actually meant for a later
+// search — which is what leaves things looking permanently "stuck".
+func (m *Manager) CancelSearch(searchID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cancelled[searchID] = true
+	for i, p := range m.pendingSearch {
+		if p.id == searchID {
+			m.pendingSearch = append(m.pendingSearch[:i], m.pendingSearch[i+1:]...)
+			break
+		}
+	}
+}
+
 // QueueDownload sends the bot command immediately (no throttle) and
 // remembers the downloadID so the eventual DCC SEND can be correlated
-// back to it via the filename hint.
+// back to it via the filename hint. A backstop timer fails it out if no
+// DCC SEND ever arrives — see dccWaitTimeout.
 func (m *Manager) QueueDownload(downloadID, command string) error {
 	if !m.client.IsConnected() {
 		return errors.New("irc not connected")
@@ -198,7 +232,51 @@ func (m *Manager) QueueDownload(downloadID, command string) error {
 	})
 	m.mu.Unlock()
 	m.client.Cmd.Message(m.cfg.Channel, command)
+	time.AfterFunc(dccWaitTimeout, func() { m.timeoutDownload(downloadID) })
 	return nil
+}
+
+// removePendingDownload drops downloadID from the not-yet-started FIFO,
+// reporting whether it was actually there (i.e. still genuinely pending).
+func (m *Manager) removePendingDownload(downloadID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, p := range m.pendingDLs {
+		if p.id == downloadID {
+			m.pendingDLs = append(m.pendingDLs[:i], m.pendingDLs[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// timeoutDownload fires dccWaitTimeout after a download was queued if it
+// never even started (no DCC SEND arrived) — e.g. the bot silently
+// dropped or ignored the request. A no-op if it already resolved (or was
+// cancelled) in the meantime, since it'll no longer be in pendingDLs.
+func (m *Manager) timeoutDownload(downloadID string) {
+	if m.removePendingDownload(downloadID) && m.cfg.Callbacks.OnDownloadFailed != nil {
+		m.cfg.Callbacks.OnDownloadFailed(downloadID, "timed out waiting for the file to start")
+	}
+}
+
+// CancelDownload gives up on a download the caller no longer wants.
+// If it hasn't started yet, it's simply dropped from pendingDLs — same
+// trick as CancelSearch, so a late DCC SEND gets silently drained
+// instead of being resurrected, and it can no longer soak up FIFO
+// correlation meant for a different, newer download. If it's already
+// mid-transfer, its context is cancelled, which force-closes the DCC
+// socket and unblocks the read loop in dcc.go.
+func (m *Manager) CancelDownload(downloadID string) {
+	if m.removePendingDownload(downloadID) {
+		return
+	}
+	m.mu.Lock()
+	cancel := m.activeDownloads[downloadID]
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // Start blocks until ctx is cancelled, reconnecting on disconnect.
@@ -207,6 +285,10 @@ func (m *Manager) QueueDownload(downloadID, command string) error {
 // alone won't unblock it. The watcher goroutine below force-closes the
 // client on shutdown so this loop can exit promptly.
 func (m *Manager) Start(ctx context.Context) {
+	m.mu.Lock()
+	m.connecting = true
+	m.mu.Unlock()
+
 	go m.searchSender(ctx)
 
 	go func() {
@@ -225,6 +307,7 @@ func (m *Manager) Start(ctx context.Context) {
 		}
 		m.mu.Lock()
 		m.connected = false
+		m.connecting = ctx.Err() == nil // still trying, unless we're shutting down
 		m.mu.Unlock()
 		if m.cfg.Callbacks.OnDisconnected != nil {
 			m.cfg.Callbacks.OnDisconnected()
@@ -244,12 +327,25 @@ func (m *Manager) Start(ctx context.Context) {
 	}
 }
 
+// consumeCancelled reports whether searchID was cancelled before being
+// sent, clearing the flag either way so it can't leak.
+func (m *Manager) consumeCancelled(searchID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cancelled := m.cancelled[searchID]
+	delete(m.cancelled, searchID)
+	return cancelled
+}
+
 func (m *Manager) searchSender(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ps := <-m.searchCh:
+			if m.consumeCancelled(ps.id) {
+				continue
+			}
 			m.mu.Lock()
 			wait := time.Until(m.lastSearchAt.Add(m.cfg.SearchGap))
 			m.mu.Unlock()
@@ -259,6 +355,10 @@ func (m *Manager) searchSender(ctx context.Context) {
 					return
 				case <-time.After(wait):
 				}
+			}
+			// Could've been cancelled while it sat out the rate-limit wait.
+			if m.consumeCancelled(ps.id) {
+				continue
 			}
 			if !m.client.IsConnected() {
 				if m.cfg.Callbacks.OnSearchFailed != nil {
@@ -282,6 +382,7 @@ func (m *Manager) installHandlers() {
 		m.cfg.Logger.Printf("irc: connected as %s", c.GetNick())
 		m.mu.Lock()
 		m.connected = true
+		m.connecting = false
 		m.nick = c.GetNick()
 		m.mu.Unlock()
 		// Server frequently sends a server NOTICE in the first ~2s; wait it out before joining.
@@ -448,15 +549,29 @@ func (m *Manager) handleDCC(raw string) {
 		pd, ok := m.popDownloadByFilename(send.Filename)
 		if !ok {
 			m.cfg.Logger.Printf("irc: unmatched book DCC SEND %s; discarding", send.Filename)
-			_ = send.Download(f) // drain so the bot doesn't hang
+			_ = send.Download(context.Background(), f) // drain so the bot doesn't hang
 			return
 		}
 		if m.cfg.Callbacks.OnDownloadStart != nil {
 			m.cfg.Callbacks.OnDownloadStart(pd.id, send.Filename, send.Size)
 		}
-		if dlErr := send.Download(f); dlErr != nil {
-			if m.cfg.Callbacks.OnDownloadFailed != nil {
+		dlCtx, cancel := context.WithCancel(context.Background())
+		m.mu.Lock()
+		m.activeDownloads[pd.id] = cancel
+		m.mu.Unlock()
+		dlErr := send.Download(dlCtx, f)
+		m.mu.Lock()
+		delete(m.activeDownloads, pd.id)
+		m.mu.Unlock()
+		cancel()
+		if dlErr != nil {
+			// A cancelled context means CancelDownload already recorded the
+			// outcome — don't clobber it with a generic connection-closed
+			// error via a second, racing callback.
+			if dlCtx.Err() == nil && m.cfg.Callbacks.OnDownloadFailed != nil {
 				m.cfg.Callbacks.OnDownloadFailed(pd.id, dlErr.Error())
+			} else {
+				m.cfg.Logger.Printf("irc: download %s cancelled mid-transfer", pd.id)
 			}
 			return
 		}
@@ -469,7 +584,7 @@ func (m *Manager) handleDCC(raw string) {
 		return
 	}
 
-	if dlErr := send.Download(f); dlErr != nil {
+	if dlErr := send.Download(context.Background(), f); dlErr != nil {
 		m.cfg.Logger.Printf("irc: dcc download (search) failed: %v", dlErr)
 		if ps, ok := m.popOldestSearchByQueryHint(send.Filename); ok && m.cfg.Callbacks.OnSearchFailed != nil {
 			m.cfg.Callbacks.OnSearchFailed(ps.id, dlErr.Error())

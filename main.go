@@ -24,10 +24,16 @@ func main() {
 
 	// Single IRC manager shared across all HTTP handlers and goroutines.
 	// Callbacks are wired after `app` is constructed so they can update
-	// PocketBase records.
+	// PocketBase records. Building the manager is cheap (no network I/O);
+	// the actual connection is deferred until the first authenticated
+	// request — see ircStartOnce below — so we don't dial IRC before any
+	// user has signed in.
 	var (
-		mgr     *ircclient.Manager
-		mgrOnce sync.Once
+		mgr          *ircclient.Manager
+		mgrOnce      sync.Once
+		ircStartOnce sync.Once
+		ircCtx       context.Context
+		ircCancel    context.CancelFunc
 	)
 
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
@@ -66,25 +72,40 @@ func main() {
 				},
 			}
 			mgr = ircclient.New(cfg)
-			ctx, cancel := context.WithCancel(context.Background())
-			go mgr.Start(ctx)
-			// Stop the IRC client when the HTTP server shuts down.
+			ircCtx, ircCancel = context.WithCancel(context.Background())
+			// Cancel on shutdown regardless of whether we ever connected.
 			app.OnTerminate().BindFunc(func(_ *core.TerminateEvent) error {
-				cancel()
+				ircCancel()
 				return nil
 			})
-			log.Printf("ebooks: irc manager started, nick=%s", mgr.Nick())
+			log.Printf("ebooks: irc manager ready (connecting on first authenticated request), nick=%s", mgr.Nick())
 		})
 
 		// All custom routes live under /api/ebooks/* and require an
 		// authenticated user from the default `users` collection.
 		api := se.Router.Group("/api/ebooks").Bind(apis.RequireAuth("users"))
 
+		// The first authenticated hit — a fresh login or a page load with
+		// an already-valid token — kicks off the actual IRC connection.
+		api.BindFunc(func(e *core.RequestEvent) error {
+			ircStartOnce.Do(func() {
+				log.Printf("ebooks: user authenticated, connecting to irc")
+				go mgr.Start(ircCtx)
+			})
+			return e.Next()
+		})
+
 		api.POST("/search", func(e *core.RequestEvent) error {
 			return handleSearch(e, mgr)
 		})
+		api.POST("/search/cancel", func(e *core.RequestEvent) error {
+			return handleCancelSearch(e, mgr)
+		})
 		api.POST("/download", func(e *core.RequestEvent) error {
 			return handleDownload(e, mgr)
+		})
+		api.POST("/download/cancel", func(e *core.RequestEvent) error {
+			return handleCancelDownload(e, mgr)
 		})
 		api.GET("/status", func(e *core.RequestEvent) error {
 			return e.JSON(http.StatusOK, mgr.Status())
@@ -136,6 +157,39 @@ func handleSearch(e *core.RequestEvent, mgr *ircclient.Manager) error {
 		"id":     rec.Id,
 		"status": "queued",
 	})
+}
+
+func handleCancelSearch(e *core.RequestEvent, mgr *ircclient.Manager) error {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := e.BindBody(&body); err != nil {
+		return e.BadRequestError("invalid body", err)
+	}
+	if body.ID == "" {
+		return e.BadRequestError("id is required", nil)
+	}
+
+	rec, err := e.App.FindRecordById("searches", body.ID)
+	if err != nil {
+		return e.NotFoundError("search not found", err)
+	}
+	if rec.GetString("owner") != e.Auth.Id {
+		return e.ForbiddenError("not your search", nil)
+	}
+
+	// Only queued/searching searches are actually in flight; cancelling an
+	// already-resolved one is a harmless no-op.
+	switch rec.GetString("status") {
+	case "queued", "searching":
+		mgr.CancelSearch(body.ID)
+		rec.Set("status", "cancelled")
+		if err := e.App.Save(rec); err != nil {
+			return e.InternalServerError("save search", err)
+		}
+	}
+
+	return e.JSON(http.StatusOK, map[string]any{"status": "cancelled"})
 }
 
 func handleDownload(e *core.RequestEvent, mgr *ircclient.Manager) error {
@@ -198,6 +252,39 @@ func handleDownload(e *core.RequestEvent, mgr *ircclient.Manager) error {
 	})
 }
 
+func handleCancelDownload(e *core.RequestEvent, mgr *ircclient.Manager) error {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := e.BindBody(&body); err != nil {
+		return e.BadRequestError("invalid body", err)
+	}
+	if body.ID == "" {
+		return e.BadRequestError("id is required", nil)
+	}
+
+	rec, err := e.App.FindRecordById("downloads", body.ID)
+	if err != nil {
+		return e.NotFoundError("download not found", err)
+	}
+	if rec.GetString("owner") != e.Auth.Id {
+		return e.ForbiddenError("not your download", nil)
+	}
+
+	// Only queued/downloading downloads are actually in flight; cancelling
+	// an already-resolved one is a harmless no-op.
+	switch rec.GetString("status") {
+	case "queued", "downloading":
+		mgr.CancelDownload(body.ID)
+		rec.Set("status", "cancelled")
+		if err := e.App.Save(rec); err != nil {
+			return e.InternalServerError("save download", err)
+		}
+	}
+
+	return e.JSON(http.StatusOK, map[string]any{"status": "cancelled"})
+}
+
 // ---- Callback helpers (run from IRC reader goroutine) ----
 
 func setSearchStatus(app core.App, searchID, status string, resultCount int, errMsg string) {
@@ -235,11 +322,26 @@ func ingestSearchResults(app core.App, searchID string, books []ircclient.BookRe
 		log.Printf("ebooks: ingestSearchResults missing collection: %v", err)
 		return
 	}
+
+	searchRec, err := app.FindRecordById("searches", searchID)
+	if err != nil {
+		log.Printf("ebooks: ingestSearchResults find search: %v", err)
+	}
+	query := ""
+	if searchRec != nil {
+		query = searchRec.GetString("query")
+	}
+
 	kept := 0
+	seen := make(map[string]bool, len(books))
 	for _, b := range books {
 		if b.Format != "epub" {
 			continue
 		}
+		key := dedupKey(b.Author, b.Title, b.Format)
+		isDup := seen[key]
+		seen[key] = true
+
 		r := core.NewRecord(resColl)
 		r.Set("search", searchID)
 		r.Set("server", b.Server)
@@ -248,16 +350,19 @@ func ingestSearchResults(app core.App, searchID string, books []ircclient.BookRe
 		r.Set("format", b.Format)
 		r.Set("size", b.Size)
 		r.Set("full", b.Full)
+		r.Set("relevance", scoreRelevance(query, b.Author, b.Title))
+		r.Set("is_duplicate", isDup)
 		if err := app.Save(r); err != nil {
 			log.Printf("ebooks: insert search_result: %v", err)
 			continue
 		}
 		kept++
 	}
-	if rec, err := app.FindRecordById("searches", searchID); err == nil {
-		rec.Set("status", "complete")
-		rec.Set("result_count", kept)
-		if err := app.Save(rec); err != nil {
+
+	if searchRec != nil {
+		searchRec.Set("status", "complete")
+		searchRec.Set("result_count", kept)
+		if err := app.Save(searchRec); err != nil {
 			log.Printf("ebooks: finalize search: %v", err)
 		}
 	}
@@ -323,4 +428,3 @@ func truncate(s string, n int) string {
 	}
 	return s[:n]
 }
-

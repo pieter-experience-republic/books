@@ -79,6 +79,8 @@ func parseLine(line string) (BookResult, error) {
 
 	size, sizeEnd := getSize(line)
 
+	author, title = unswapAuthorTitle(author, title)
+
 	return BookResult{
 		Server: server,
 		Author: author,
@@ -87,6 +89,27 @@ func parseLine(line string) (BookResult, error) {
 		Size:   size,
 		Full:   strings.TrimSpace(line[:sizeEnd]),
 	}, nil
+}
+
+// unswapAuthorTitle catches filenames built as "Title, The - Author" (a
+// common catalog convention that moves a leading article to the end so the
+// title alphabetizes correctly, e.g. "Art of War, The" for "The Art of
+// War"). getAuthor/getTitle assume "Author - Title" order, so this pattern
+// lands the real title in the author slot and vice versa. A ", The"/", A"/
+// ", An" suffix on what we parsed as the author is an unambiguous signal
+// the fields are reversed.
+func unswapAuthorTitle(author, title string) (string, string) {
+	trimmed := strings.TrimRight(author, " ")
+	lower := strings.ToLower(trimmed)
+	for _, article := range [...]string{"the", "a", "an"} {
+		suffix := ", " + article
+		if strings.HasSuffix(lower, suffix) {
+			base := strings.TrimSpace(trimmed[:len(trimmed)-len(suffix)])
+			word := trimmed[len(trimmed)-len(article):] // preserve original casing
+			return title, word + " " + base
+		}
+	}
+	return author, title
 }
 
 func getServer(line string) (string, error) {

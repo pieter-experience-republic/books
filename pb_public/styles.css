@@ -29,6 +29,7 @@ header {
 }
 header h1 { margin: 0; font-size: 1.1rem; letter-spacing: .03em; }
 #user-bar { margin-left: auto; display: flex; gap: .6rem; align-items: center; color: var(--fg-dim); }
+#user-bar[hidden] { display: none; }
 
 main { padding: 1.2rem; max-width: 1100px; margin: 0 auto; }
 
@@ -49,6 +50,57 @@ button:hover { background: #1f242c; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 
 #cooldown { color: var(--fg-dim); font-size: .9em; }
+.search-tip { margin: -.6rem 0 1rem; font-size: .85em; }
+
+#results-status {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  color: var(--fg-dim);
+  margin: 0 0 1rem;
+}
+#results-status[hidden] { display: none; }
+#results-status .cancel-search-btn {
+  margin-left: auto;
+  padding: .25rem .6rem;
+  font-size: .85em;
+  flex-shrink: 0;
+}
+
+/* Collapsible sections (Downloads, Search history) share one look; only
+   history is dimmed down further since it's rarely what's needed. */
+section > details {
+  margin-top: 1.6rem;
+}
+section > details > summary {
+  cursor: pointer;
+  user-select: none;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+section > details > summary:hover { color: var(--fg); }
+section > details > table { margin-top: .6rem; }
+section > details > .helper-line { margin: .5rem 0 0; font-size: .85em; }
+
+#history-details > summary { font-size: .85rem; }
+
+#downloads-table .cancel-download-btn {
+  padding: .25rem .6rem;
+  font-size: .85em;
+}
+
+.btn-active-download {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+}
+.btn-active-download .cancel-x {
+  font-weight: 700;
+  line-height: 1;
+  color: var(--fg-dim);
+}
+.btn-active-download:hover:not(:disabled) { border-color: var(--err); }
+.btn-active-download:hover:not(:disabled) .cancel-x { color: var(--err); }
 
 table {
   width: 100%;
@@ -103,6 +155,7 @@ tbody tr:hover { background: #1a2029; }
 
 .pill {
   display: inline-flex;
+  align-items: center;
   padding: .2rem .55rem;
   border-radius: 999px;
   font-size: .8rem;
@@ -111,10 +164,21 @@ tbody tr:hover { background: #1a2029; }
 }
 .pill-off { color: var(--err); }
 .pill-on { color: var(--ok); }
+.pill-warn { color: var(--warn); }
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  margin-right: .4rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+.pill-on .status-dot { box-shadow: 0 0 4px 0 currentColor; }
 
 .status-queued, .status-searching, .status-downloading { color: var(--warn); }
 .status-complete { color: var(--ok); }
 .status-failed { color: var(--err); }
+.status-cancelled { color: var(--fg-dim); }
 
 .error { color: var(--err); margin: .5rem 0 0; min-height: 1.1em; }
 .dim { color: var(--fg-dim); }
@@ -150,3 +214,43 @@ tr.show-more td {
   padding: .65rem;
 }
 tr.show-more:hover td { background: #1a2029; }
+
+/* Same book already listed under a better-ranked bot — still downloadable,
+   just visually pushed behind the non-duplicate results. */
+tr.result-duplicate > td { color: var(--fg-dim); }
+
+#toast-container {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: .5rem;
+  z-index: 100;
+  max-width: min(360px, calc(100vw - 2rem));
+}
+#toast-container[hidden] { display: none; }
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: .6rem .7rem;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .4);
+  animation: toast-in .18s ease-out;
+}
+.toast span { flex: 1; overflow-wrap: anywhere; }
+.toast button { padding: .3rem .6rem; font-size: .85em; white-space: nowrap; }
+.toast.toast-err { border-color: var(--err); }
+.toast.leaving { animation: toast-out .15s ease-in forwards; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes toast-out {
+  to { opacity: 0; transform: translateY(8px); }
+}
